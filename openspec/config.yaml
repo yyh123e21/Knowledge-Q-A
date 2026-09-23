@@ -1,0 +1,170 @@
+schema: spec-driven
+
+# 项目背景与约束。不写进任何 artifact，只在生成 artifact 时约束 AI。
+context: |
+  ## 是什么
+
+  《Hello-Agents》第 8 章的示例项目：一个 Gradio 应用，把文档（PDF / Word / 音频 / 图片等）
+  提取成 markdown、切分成 chunk、向量化入 Qdrant，再基于知识库做问答。已有两个能力规格——
+  `document-chunking`（切分工作台、提取质量、覆盖率）与 `rag-namespace-consistency`
+  （读写命名空间一致）。规格是行为契约，`openspec/specs/` 是准绳，代码是它的实现。
+
+  ## 技术栈与环境
+
+  - Python 3 + Gradio。没有依赖清单，没有 Web 框架，没有 ORM。
+  - 解释器是 conda 环境 `HelloAgent`（`C:/Users/yyh15/.conda/envs/HelloAgent/python.exe`）。
+    但 `hello_agents` 实际从**用户级** site-packages
+    （`C:/Users/yyh15/AppData/Roaming/Python/Python313/site-packages`）加载，不在 conda 环境里
+    ——往 conda 环境装同名包不会覆盖它。
+  - 向量库：本地 Qdrant `http://localhost:6333`。**单集合 + 载荷标签分区**：集合名是
+    `rag_knowledge_base`，靠 payload 的 `rag_namespace` 区分用户与用途。`.env` 里的
+    `QDRANT_COLLECTION` 实际不生效，改它换不了集合。
+  - embedding：本机 Ollama 的 `nomic-embed-text`。库把读超时写死成 30 秒的字面量。
+  - LLM：DeepSeek，见 `.env` 的 `LLM_*`。
+  - 文档提取：库转调 MarkItDown。PDF 还带一段库内的后处理（`_post_process_pdf_text`），
+    只做「丢短行、合并长行」，不处理编码噪声。
+  - `hello_agents` 是外部库，代码不在本仓库。本项目是在它之上写的应用层。
+
+  ## 架构
+
+      文件 ──extract_markdown()──> markdown 文本(已清洗) ──splitter──> Chunk[]
+                                                                        |
+                                            materialize() <─────────────┘
+                                                  |                (唯一物化点)
+                          +-----------------------+-----------------------+
+                          v                                               v
+                  chunk_viz 渲染预览                        index_chunks(store, ...)
+                          |                                               |
+                          +──── 使用者据此决定是否入库 ──────────────────+
+
+  三个文件的职责，不要越界：
+
+  - `chunking.py` —— 提取、清洗、质量与覆盖率度量、三种切分器、原子向量缓存、`materialize`、
+    入库与回看。所有「算数」的逻辑都在这。
+  - `chunk_viz.py` —— 纯渲染。输入 chunk 列表与度量，输出 HTML。不读库、不算数、不发请求。
+  - `11_Q&A_Assistant.py` —— 只做 UI 接线与 Gradio 回调。
+
+  五个「唯一入口」。改代码前先找它们；需要新能力时扩展入口，不要在别处另开一条路径：
+
+  | 唯一入口 | 绕过它会发生什么 |
+  |---|---|
+  | `chunking.extract_markdown()` | 预览与入库消费两份文本，chunk 偏移对不上 |
+  | `chunking.materialize()` | 同上，且预览漂移在结构上变得可能 |
+  | 库的 `index_chunks(store, chunks, rag_namespace=...)` | 手工复刻四个过滤标签，漏一个就静默搜不到 |
+  | `PDFLearningAssistant._rag()` | namespace 回落到 `default`，检索到别处的文档 |
+  | `PDFLearningAssistant.delete_document()` | 跳过删除前的核对与删除后的回读——报「已删除 0 块」的假成功，或删到别的命名空间 |
+
+  ## 目录约定
+
+  - `01_*.py` … `10_*.py` 是按顺序学习的章节脚本，**互不 import、各自独立**。不要修改它们，
+    也不要让新代码 import 它们。
+  - `11_Q&A_Assistant.py` 是本章主程序（即本项目）。无数字前缀的 `chunking.py` /
+    `chunk_viz.py` 是从它拆出的模块。新代码优先放模块，不要继续堆进 `11_`。
+  - `*备份.py` 是历史备份，不参与运行，不改。
+  - `testconfig.py` / `testloadEmbeding.py` 是手工连通性脚本，不是测试套件。
+  - **本项目没有测试框架**（无 pytest / unittest / CI）。验证靠一次性脚本与直接断言；
+    没有「跑一下测试」这个动作，要具体写清跑什么、断言什么。
+  - `memory_data/memory.db`、`knowledge_base/`、`notes_*.json` 是运行期数据，不是代码。
+  - `openspec/specs/` 是能力规格（合入后的主 spec），`openspec/changes/` 是进行中的变更，
+    已归档的在 `changes/archive/YYYY-MM-DD-<name>/`。
+
+  ## 禁区
+
+  1. **不改 `hello_agents`**：不 monkeypatch、不 fork、不打补丁、不做 vendoring（在 `sys.path`
+     前置一份副本）。它在 site-packages 里，重装即失效；副本会与上游漂移，学习者调试时看到的
+     是副本而不是真实的库。库的行为不合意时，在应用层显式传参，或自行实现——切分逻辑就是
+     这样上移到应用层的。
+  2. **不直接调 `store.add_vectors`**：入库只走 `index_chunks`。检索要求四个字段同时命中
+     （`memory_type="rag_chunk"`、`is_rag_data=True`、`data_source="rag_pipeline"`、
+     `rag_namespace=<ns>`），漏一个的表现是**静默搜不到**——不抛异常、不报错、相似度也正常。
+  3. **不依赖库对 namespace 的默认值**：`RAGTool.run` 里 `parameters.get("namespace", "default")`
+     是写死的字面量，与构造时传入的 `rag_namespace` 无关。所有读库操作走 `_rag()`。
+  4. **不用 `unicodedata.normalize("NFKC")`**：它会把中文全角标点（`，` `。` `？` `：` `（）`）
+     改成 ASCII，是对中文文档的误伤。清洗只做三类定点改动：删私用区码位、全角拉丁与全角数字
+     转半角、折叠两侧均为汉字的空格。除这三类之外一个字都不动。
+  5. **覆盖率不用「Σ chunk 字符数 ÷ 文本长度」**：chunk 之间的重叠会让它超过 100%，于是无法
+     区分「切分完好」与「重复计入」。必须用位置区间并集。冗余是另一个数，与覆盖率分开呈现。
+  6. **不动既有知识库数据**：存量 chunk 不迁移、不自动重切、不修偏移。验证与调试需要写入时用
+     临时命名空间（如 `docs_qualitycheck`）并在事后清理；`docs_yyh` 下是真实使用数据，只读核对。
+     早期章节脚本写进 `default` 命名空间的数据一律不动。
+  7. **`.env` 里有真实可用的密钥**：任何输出、日志、命令回显都不得带出 `*_KEY` / `*_TOKEN` /
+     `*_SECRET` 的值。需要确认配置时只列变量名，不要把值打印出来。
+  8. **不引入第三方切分或提取框架**（langchain-text-splitters、unstructured 之类）。切分是本章
+     的教学内容，必须是自己可读、可改、可调试的代码。
+  9. **不静默降级**：编码超时、写入条数不符、embedding 不可用，这些失败在库里都不抛异常
+     （超时后塞零向量、条数对不上按 zip 截断，然后照常报告成功）。应用层必须自己回读核对，
+     对不上就报错，绝不能在失败时报成功。
+
+# 各 artifact 的约束。只在生成对应 artifact 时生效，不写进文件。
+# 规则正文用 |- 字面块标量：正文里有冒号和反引号，普通标量会被 YAML 解析器拒掉；
+# 用折叠标量（>-）又会在断行处给中文插进多余空格。
+rules:
+  proposal:
+    - |-
+      「现状」与「问题」必须带可复现的证据：哪份文档、做了什么操作、出来什么数。
+      不写「可能存在」「体验不佳」这类无法验证的描述。
+    - |-
+      明确列出 Non-goals，每条给出不做的理由。范围蔓延是这个项目反复出现的问题：
+      一个「加个指标」的请求最后变成「清洗 + 质量度量 + 覆盖率」三件事。
+    - |-
+      每条 What Changes 要说清落在哪个文件或模块。说不清落点的条目，说明还没想清楚。
+    - |-
+      写可判定的结果，不写形容词。用「X 情况下不再出现 Y」，不用「更准确」「更流畅」。
+    - |-
+      每条改动都要能被后续的 spec 场景验收。写不出场景的条目不要放进来。
+
+  design:
+    - |-
+      决策逐条编号 D1、D2…… 每条写全四件事：选择、被否决的替代方案、否决理由、代价。
+      只写选中方案的条目不算决策，退回去补。
+    - |-
+      凡依赖 hello_agents 的行为，标注到「文件:行号」，并区分「已实测确认」与「据源码推测」。
+      这个库不归我们改，猜错的代价是整个设计作废。
+    - |-
+      涉及数字的决策（阈值、批量大小、超时、窗口宽度）必须写明这个数是怎么量出来的；
+      量不出来就写「待实测」，不要估一个看起来合理的数。
+    - |-
+      必须有一节列出本次不能破坏的既有契约，逐条指回对应 spec 的 requirement 名称。
+    - |-
+      风险条目要写清失效的形态：抛异常、报错，还是静默劣化。静默劣化的排最前——
+      那是这个项目里最难发现的一类问题。
+    - |-
+      不写「如何实现某个函数」的步骤，那是 tasks 的事。design 回答的是「为什么选这个方案」。
+
+  specs:
+    - |-
+      requirement 用 SHALL / MUST / MUST NOT 陈述行为。scenario 标题用四个井号
+      （`#### Scenario: <名>`），正文是 `- **WHEN**` / `- **THEN**`，可选 `- **AND**`。
+      井号数不多不少，否则 validate 不通过。
+    - |-
+      scenario 必须可判定：给出具体的输入、操作或数字。写不出断言的 requirement
+      说明还没想清楚，不要先写下来占位。
+    - |-
+      只写外部可观察的行为，不写函数名、字段名、文件路径、模块划分——那些属 design。
+      可观察的对象是：使用者在界面上看到什么、知识库里的内容变成什么、检索能不能命中。
+    - |-
+      数值阈值要说明来源（实测 / 约定 / 暂定），并写明它是判据还是仅呈现。本项目对
+      「拿统计特征当告警判据」有明确禁令——那类特征在检索正常的文档上同样可能很极端，
+      据其判定会对健康文档误报。
+    - |-
+      往既有 capability 里加 requirement 时，只动本次相关的那些，其余逐字保留、顺序不变。
+      不要给已有能力的 delta 补 `## Purpose`——主 spec 已有的 Purpose 是准绳。
+    - |-
+      「不做某事」归 proposal 的 Non-goals，不写成 requirement。但「MUST NOT 用某口径计算」
+      这类防止误实现的约束要写成 requirement，因为它可违反，且违反了看不出来。
+
+  tasks:
+    - |-
+      一条任务 = 一次可验证的断言。写「实现 X 功能」这种颗粒度不合格，要写到能一次跑完
+      并断言某几个具体值的程度。
+    - |-
+      每条任务附验证动作：跑哪个脚本、怎么调、断言什么。本项目没有测试框架，
+      「跑测试」不是一个可执行的指令。
+    - |-
+      涉及写知识库的任务必须写明用哪个命名空间。没写明的一律按「不写 docs_yyh」处理。
+    - |-
+      任务编号一经使用不再改动。实现过程中发现的补充信息追加在原任务下，用
+      「补充（…时发现）：」起头，不要新开任务、不要重排编号。
+    - |-
+      只有行为完整实现才勾 `- [x]`。部分完成、降级处理、或「以后再说」一律不勾，
+      并在该任务下写明差在哪。
