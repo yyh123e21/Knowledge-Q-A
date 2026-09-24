@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 from hello_agents.memory.embedding import get_text_embedder
 
+import vision
+
 
 # ===========================================================================
 # 错误类型
@@ -55,9 +57,10 @@ class IndexingError(ChunkingError):
 class ExtractRecord(NamedTuple):
     """一次提取的完整结果（design.md D6）。
 
-    四项一起存，是为了让预览、入库、``is_fresh`` 三处拿到同一份记录且不重算，
-    同时让告警能回答三件事：检出了什么（``raw_quality``）、清掉了多少
-    （``clean_counts``）、什么没修（``clean_quality``）。
+    一起存是为了让预览、入库、``is_fresh`` 三处拿到同一份记录且不重算，
+    同时回答四件事：检出了什么（``raw_quality``）、清掉了多少
+    （``clean_counts``）、什么没修（``clean_quality``）、每一页的视觉结局
+    是什么（``vision``）。
     """
 
     text: str                      # 清洗后的文本——切分与入库消费的就是它
@@ -65,10 +68,13 @@ class ExtractRecord(NamedTuple):
     raw_quality: Dict[str, Any]    # 清洗前的度量；**判定用这份**（design.md D5）
     clean_quality: Dict[str, Any]  # 清洗后的度量，用于说明「什么没修」
     clean_counts: Dict[str, int]   # 三类改动的计数，即「清掉了多少」
+    # 逐页视觉结局；未走视觉提取时为 None。存对象而不是摘要串，是因为预览
+    # 既要那一行计数（5.1）也要逐页的两个字符数（5.2），两者出自同一份结果。
+    vision: Optional[vision.VisionExtraction] = None
 
 
-#: 缓存键 -> 提取记录。键为 (绝对路径, mtime, 文件大小)。
-_EXTRACT_CACHE: Dict[Tuple[str, float, int], ExtractRecord] = {}
+#: 缓存键 -> 提取记录。键为 (绝对路径, mtime, 文件大小, 视觉配置指纹)。
+_EXTRACT_CACHE: Dict[Tuple[str, float, int, str], ExtractRecord] = {}
 
 #: 供验证用的计数器（见 tasks.md 1.2）。
 _EXTRACT_STATS = {"convert_calls": 0, "cache_hits": 0}
@@ -137,8 +143,69 @@ def _convert_via_library(path: str) -> str:
         return ""
 
 
+def _vision_key_fragment(path: str) -> str:
+    """把视觉配置指纹并进提取缓存的键（design.md D5）。
+
+    不适用视觉的路径返回空串——于是「未启用视觉」时的缓存键与改动前完全一致，
+    行为逐字不变（任务 3.2 就是靠这一点成立的）。
+
+    为什么非并不可：``_EXTRACT_CACHE`` 原来的键只有 ``(路径, mtime, 大小)``，而
+    ``is_fresh()`` 自己会调 ``extract_markdown()``。改完 ``VLM_MODEL_ID`` 后它会命中
+    旧键、拿到**旧模型**产出的 T′，算出没变的 ``markdown_hash``，于是返回 True——
+    使用者直接把一份旧模型的文本入了库，一路上没有任何报错。
+    """
+    if not vision.is_visual_format(path):
+        return ""
+    cfg = vision.load_config()
+    return cfg.fingerprint if cfg is not None else ""
+
+
+def _extract_cache_key(path: str) -> Optional[Tuple[str, float, int, str]]:
+    """某路径此刻的提取缓存键；路径不可读时返回 ``None``。
+
+    存与取共用这一处。3.5 给键加了第四个分量（视觉配置指纹）时，取值那处仍是
+    三元组，四元组恒不等于三元组，于是质量报告在预览里静默消失——两处各写一份
+    键的算法，改一处就漏一处（实测见 tasks.md 5.3）。
+    """
+    try:
+        if not os.path.exists(path):
+            return None
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path), st.st_mtime, st.st_size, _vision_key_fragment(path))
+
+
+def _extract_with_vision(path: str) -> Optional[vision.VisionExtraction]:
+    """走视觉提取拿到结果。返回 ``None`` 表示「这条路不归视觉管，走原来的库提取」。
+
+    返回整个 ``VisionExtraction`` 而不是它的 ``.text``：预览要展示逐页结局与
+    逐页字符对照（5.1–5.4），那些信息只在这一层有，丢掉就再也拿不回来了。
+
+    Raises:
+        ChunkingError: 图片文件的视觉提取不可用（design.md D10）。
+    """
+    if not vision.is_visual_format(path):
+        return None
+
+    if vision.load_config() is None:
+        if vision.is_pdf(path):
+            # PDF 还有库提取这条路：静默回落到原路，行为与改动前逐字相同（3.2）。
+            return None
+        # 图片文件没有别的路——原来的路是把 PNG 的二进制当文本读进来
+        # （1.3 实测：89058 字符的 IHDR/IDAT 噪声，还带着 100% 的覆盖率）。
+        # 宁可明确失败，也不能把二进制噪声当正文入库（D10、禁区 9）。
+        missing = "、".join(vision.missing_config_names()) or "VLM_*"
+        raise ChunkingError(
+            f"图片文件需要视觉提取，但视觉配置不全：.env 缺少 {missing}。"
+            f"补齐后重新预览；本工具不会把图片的二进制内容当作正文。"
+        )
+
+    return vision.extract(path)
+
+
 def _extract_record(path: str) -> ExtractRecord:
-    """提取 -> 度量 -> 清洗，结果按 ``(路径, mtime, 大小)`` 缓存。
+    """提取 -> 度量 -> 清洗，结果按 ``(路径, mtime, 大小, 视觉配置指纹)`` 缓存。
 
     清洗放在这条漏斗内部（design.md D1）：三个调用点（入库、预览、``is_fresh``）
     自动全部覆盖，且预览与入库消费的是同一份文本——「预览与入库一致」与「位置
@@ -153,14 +220,21 @@ def _extract_record(path: str) -> ExtractRecord:
     if ext not in _supported_extensions():
         raise UnsupportedFormatError(f"不支持的格式: {ext or '(无扩展名)'}")
 
-    st = os.stat(path)
-    key = (os.path.abspath(path), st.st_mtime, st.st_size)
+    key = _extract_cache_key(path)
+    if key is None:
+        raise ChunkingError(f"文件不存在: {path}")
     if key in _EXTRACT_CACHE:
         _EXTRACT_STATS["cache_hits"] += 1
         return _EXTRACT_CACHE[key]
 
     _EXTRACT_STATS["convert_calls"] += 1
-    text = _convert_via_library(path)
+    # 视觉可用且文件是 PDF / 图片时，正文来自视觉转写，此时不再调库的转换
+    # ——库那份提取既没有页信息，也读不到图（design.md D9）。
+    extraction = _extract_with_vision(path)
+    if extraction is None:
+        text = _convert_via_library(path)
+    else:
+        text = extraction.text
     if not text or not text.strip():
         raise EmptyContentError("未能从文件中提取到任何文本内容")
 
@@ -172,6 +246,7 @@ def _extract_record(path: str) -> ExtractRecord:
         raw_quality=raw_quality,
         clean_quality=assess_extraction_quality(cleaned),
         clean_counts=counts,
+        vision=extraction,
     )
 
     _EXTRACT_CACHE[key] = record
@@ -179,10 +254,12 @@ def _extract_record(path: str) -> ExtractRecord:
 
 
 def extract_markdown(path: str) -> str:
-    """提取文档的 markdown 文本（已清洗），按 ``(路径, mtime, 大小)`` 缓存。
+    """提取文档的 markdown 文本（已清洗），按
+    ``(路径, mtime, 大小, 视觉配置指纹)`` 缓存。
 
     PDF / 音频 / 图片的提取包含 OCR 与语音转写，是最贵的一步。缓存让使用者
-    在策略之间来回切换、反复调参时不必重复付出这个代价。
+    在策略之间来回切换、反复调参时不必重复付出这个代价。第四个分量只在视觉
+    路径上非空，换模型或换提示词都会让它变，于是旧转写不会被复用（design.md D4）。
 
     Raises:
         UnsupportedFormatError: 扩展名不在支持列表内。
@@ -210,24 +287,35 @@ def _quality_report(record: ExtractRecord) -> Dict[str, Any]:
     }
 
 
-def cached_quality_report(path: str) -> Optional[Dict[str, Any]]:
-    """取某路径**已缓存**的质量报告；没提取过就返回 ``None``，不抛异常。
+def _cached_record(path: str) -> Optional[ExtractRecord]:
+    """取某路径**已缓存**的提取记录；没提取过就返回 ``None``，不抛异常。
 
     只读缓存、不触发提取：调用方要的是「这次提取检出了什么」，为此把文件重新
     提取一遍既慢又没必要。
+    """
+    key = _extract_cache_key(path)
+    return _EXTRACT_CACHE.get(key) if key else None
+
+
+def cached_quality_report(path: str) -> Optional[Dict[str, Any]]:
+    """取某路径**已缓存**的质量报告；没提取过就返回 ``None``，不抛异常。
 
     注意这份报告活在内存里，重启即空——所以回看路径**不用**它，改从已存 chunk
     的文本度量（design.md D12）。
     """
-    try:
-        if not os.path.exists(path):
-            return None
-        st = os.stat(path)
-    except OSError:
-        return None
-
-    record = _EXTRACT_CACHE.get((os.path.abspath(path), st.st_mtime, st.st_size))
+    record = _cached_record(path)
     return _quality_report(record) if record else None
+
+
+def cached_vision_extraction(path: str) -> Optional[vision.VisionExtraction]:
+    """取某路径**已缓存**的逐页视觉结局；没提取过或未走视觉时返回 ``None``。
+
+    形状与 :func:`cached_quality_report` 一致（只读缓存、不触发提取、不抛异常），
+    所以预览里两行摘要的取法相同。未启用视觉时返回 ``None``——于是那类预览的
+    状态串与改动前逐字相同，「合格时不打扰」在视觉这一路也成立。
+    """
+    record = _cached_record(path)
+    return record.vision if record else None
 
 
 def extraction_stats() -> Dict[str, int]:
@@ -527,29 +615,67 @@ def approx_token_len(text: str) -> int:
 #: 围栏代码块的起止标记（``` 或 ~~~）。
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
+#: 视觉描述块的成对标记（design.md D6）。写法由 `vision` 模块单点定义，
+#: 这里只引用不再抄一份——标记形态在 2.3 收敛过一次，两处各写一份就会漂移。
+#: 这两个正则要求标记独占一行（已 strip），正是 `vision.normalize_vision_markers`
+#: 保证的形态：进了 T′ 的标记一定是规范的。
+_VISION_OPEN_RE = vision.VISION_OPEN_RE
+_VISION_CLOSE_RE = vision.VISION_CLOSE_RE
+
 
 def _scan_lines(text: str):
-    """逐行扫描，产出 ``(偏移, 原始行, 是否处于围栏代码块内)``。
+    """逐行扫描，产出 ``(偏移, 原始行, 是否处于整体保留区间内)``。
 
-    围栏状态必须显式跟踪：代码块里的 ``# 注释`` 也是以 ``#`` 开头的，
-    不区分就会把代码注释当成标题解析，进而污染标题路径。
+    两类区间必须显式跟踪：**围栏代码块**与**视觉描述块**。
+
+    代码块里的 ``# 注释`` 也是以 ``#`` 开头的，不区分就会把代码注释当成标题解析，
+    进而污染标题路径。视觉块里的转写文字同理——一页转写里出现 ``# 1 引言``
+    这样的行完全可能（提示词要的正是 markdown 结构），而块内的空行会把它与
+    标记切开。两者都是「块内的一切都不参与结构判断」。
+
+    第三个元素历史上叫 ``in_fence``，现在表示「处于任一整体保留区间内」。
+    调用方原本就只拿它做「不要在这里断」的判断，语义没有变。
+
+    嵌套按「谁先开谁吃到自己的闭标记」处理：代码块里的 ``[[VISION`` 是注释文字，
+    视觉块里的 ```` ``` ```` 是转写文字，互不干扰。
     """
     in_fence = False
     marker: Optional[str] = None
+    in_vision = False
     pos = 0
 
     for raw in text.splitlines(keepends=True):
-        m = _FENCE_RE.match(raw)
-        if m:
-            if not in_fence:
-                in_fence, marker = True, m.group(1)
-            elif m.group(1) == marker:
+        stripped = raw.strip()
+
+        if in_fence:
+            m = _FENCE_RE.match(raw)
+            if m and m.group(1) == marker:
                 in_fence, marker = False, None
             yield pos, raw, True
             pos += len(raw)
             continue
 
-        yield pos, raw, in_fence
+        if in_vision:
+            if _VISION_CLOSE_RE.match(stripped):
+                in_vision = False
+            yield pos, raw, True
+            pos += len(raw)
+            continue
+
+        m = _FENCE_RE.match(raw)
+        if m:
+            in_fence, marker = True, m.group(1)
+            yield pos, raw, True
+            pos += len(raw)
+            continue
+
+        if _VISION_OPEN_RE.match(stripped):
+            in_vision = True
+            yield pos, raw, True
+            pos += len(raw)
+            continue
+
+        yield pos, raw, False
         pos += len(raw)
 
 
@@ -731,6 +857,12 @@ def _split_oversized(
 
     没有这层兜底，一个没有空行的长页面会产出上万字的单个 chunk：既撑爆
     上下文，又因为向量被整段稀释而检索不到。
+
+    拆的粒度是**原子**（句子，外加整体保留的视觉块），不是裸句子。少了这一层，
+    一个「正文 + 视觉块」的长段落会在这里被按句切开——而它正是最常见的形态：
+    一页的转写往往就超过块大小（封思敏那份 70 页里多数如此），于是视觉块
+    会被拦腰截断，且不报任何错。区块自身超预算时仍走硬拆，这是 spec 允许的
+    唯一例外（「超长视觉块仍受块大小约束」）。
     """
     if counter(text[start:end]) <= budget:
         return [(start, end)]
@@ -740,7 +872,7 @@ def _split_oversized(
     cur_end = start
     cur_len = 0
 
-    for s, e in _iter_sentences(text, start, end):
+    for s, e in _iter_atoms_in_range(text, start, end, _vision_regions(text)):
         seg_len = counter(text[s:e]) or 1
         if seg_len > budget:
             if cur_start is not None:
@@ -956,13 +1088,15 @@ def _batch_by_chars(texts: Sequence[str], budget: int) -> List[List[str]]:
     return batches
 
 
-def _protected_regions(text: str) -> List[Tuple[int, int]]:
-    """找出必须整体保留的区间：围栏代码块与连续表格行。
+def _iter_region_spans(text: str) -> List[Tuple[int, int, str]]:
+    """扫描全文，产出 ``(起点, 终点, 类别)``，类别 ∈ ``{"fence", "table", "vision"}``。
 
-    代码块和表格在语义上是一个整体。切开它们既产生无意义的向量，展示时
-    也会把代码和表格割裂开——这正好是学习者在看切分结果时最不能接受的一种错。
+    按起点有序、互不重叠——闭标记被吃进所属区间，所以不会有交叠。
+
+    单独抽出来是为了让「只认视觉块」的调用方复用同一套扫描，而不是各写一份
+    逐行状态机。写法不一致时，两边对「什么算一个块」的判断迟早会分叉。
     """
-    regions: List[Tuple[int, int]] = []
+    spans: List[Tuple[int, int, str]] = []
     lines = text.splitlines(keepends=True)
     pos = 0
     i = 0
@@ -970,6 +1104,8 @@ def _protected_regions(text: str) -> List[Tuple[int, int]]:
 
     while i < n:
         line = lines[i]
+        stripped = line.strip()
+
         m = _FENCE_RE.match(line)
         if m:
             fence = m.group(1)
@@ -983,7 +1119,22 @@ def _protected_regions(text: str) -> List[Tuple[int, int]]:
                     i += 1
                     break
                 i += 1
-            regions.append((start, pos))
+            spans.append((start, pos, "fence"))
+            continue
+
+        if _VISION_OPEN_RE.match(stripped):
+            start = pos
+            pos += len(line)
+            i += 1
+            # 没有闭标记时一直吃到文末——protect 到底，不因为模型漏了闭标记
+            # 就把半块描述当正文切。这与未闭合围栏的处理一致。
+            while i < n:
+                pos += len(lines[i])
+                if _VISION_CLOSE_RE.match(lines[i].strip()):
+                    i += 1
+                    break
+                i += 1
+            spans.append((start, pos, "vision"))
             continue
 
         if line.lstrip().startswith("|"):
@@ -991,27 +1142,67 @@ def _protected_regions(text: str) -> List[Tuple[int, int]]:
             while i < n and lines[i].lstrip().startswith("|"):
                 pos += len(lines[i])
                 i += 1
-            regions.append((start, pos))
+            spans.append((start, pos, "table"))
             continue
 
         pos += len(line)
         i += 1
 
-    return regions
+    return spans
 
 
-def _iter_atoms(text: str) -> List[Tuple[int, int]]:
-    """切出语义分割的原子单元：句子级，但代码块与表格整体不拆。"""
-    regions = _protected_regions(text)
+def _protected_regions(text: str) -> List[Tuple[int, int]]:
+    """找出必须整体保留的区间：围栏代码块、视觉描述块、连续表格行。
+
+    代码块、视觉描述与表格在语义上都是一个整体。切开它们既产生无意义的向量，
+    展示时也会把它们割裂开——这正好是学习者在看切分结果时最不能接受的一种错。
+    视觉块还多一层理由：它是模型对一页图的**一段**描述，切开后每一半都既不
+    完整也不自洽（spec「视觉描述在切分中保持完整」）。
+    """
+    return [(s, e) for s, e, _kind in _iter_region_spans(text)]
+
+
+def _vision_regions(text: str) -> List[Tuple[int, int]]:
+    """只取视觉描述块的区间。
+
+    与 `_protected_regions` 分开，是因为两者的调用面不同：语义分割的原子层
+    （`_iter_atoms`）从一开始就保护代码块与表格，而尺寸兜底
+    （`_split_oversized`）历史上按句子切、会切穿它们。本次只把视觉块补进
+    尺寸兜底——顺带「修好」代码块与表格会改变既有文档的切分结果，而
+    6.5 要证明的恰恰是「未启用视觉时切分与改动前一致」。两件事不混在一个变更里。
+    """
+    return [(s, e) for s, e, kind in _iter_region_spans(text) if kind == "vision"]
+
+
+def _iter_atoms_in_range(
+    text: str, start: int, end: int, regions: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """``[start, end)`` 内的句子级原子：``regions`` 里的区间整体不拆。
+
+    ``regions`` 必须按起点有序（`_iter_region_spans` 的产物即是），且不必先
+    裁剪到 ``[start, end)``——落在范围外的会被跳过，跨界的会被收进边界。
+    """
     atoms: List[Tuple[int, int]] = []
-    cursor = 0
+    cursor = start
 
     for r_start, r_end in regions:
+        if r_end <= start:
+            continue
+        if r_start >= end:
+            break
+        r_start = max(r_start, start)
+        r_end = min(r_end, end)
         atoms.extend(_iter_sentences(text, cursor, r_start))
         atoms.append((r_start, r_end))
         cursor = r_end
-    atoms.extend(_iter_sentences(text, cursor, len(text)))
 
+    atoms.extend(_iter_sentences(text, cursor, end))
+    return atoms
+
+
+def _iter_atoms(text: str) -> List[Tuple[int, int]]:
+    """切出语义分割的原子单元：句子级，但代码块、视觉块与表格整体不拆。"""
+    atoms = _iter_atoms_in_range(text, 0, len(text), _protected_regions(text))
     return [(s, e) for s, e in atoms if text[s:e].strip()]
 
 
@@ -1225,12 +1416,18 @@ def split_semantic(
 
     # 尺寸兜底：把仍超上限的块按句末标点继续拆（这里按字符计，因为
     # 语义策略的最小/最大块参数就是以字符计的）
+    #
+    # 拆出来的每一段必须**各自成为一组**。写成 `final_units.append(pieces)`
+    # 会把它们当成一组，而下面取 chunk 边界用的是 `g[0][0]` 与 `g[-1][1]`
+    # ——组首与组尾合起来正是拆分前的整个区间，于是这一段兜底等于没做，
+    # 超限的 chunk 原样产出。四种原子（句、围栏块、表格、视觉块）都能大到
+    # 触发它：本次就是「一页的转写整块超过 max_chars」暴露出来的。
     final_units: List[List[Tuple[int, int]]] = []
     for g in groups:
         g_start, g_end = g[0][0], g[-1][1]
         if (g_end - g_start) > max_chars:
             pieces = _split_oversized(text, g_start, g_end, max_chars, len)
-            final_units.append(pieces)
+            final_units.extend([p] for p in pieces)
         else:
             final_units.append(g)
 

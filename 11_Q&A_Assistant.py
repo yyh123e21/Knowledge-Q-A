@@ -205,6 +205,10 @@ class PDFLearningAssistant:
         wb = self.workbench
         label = ck.STRATEGIES[strategy]["label"]
         coverage = ck.assess_coverage(wb.chunks, len(wb.markdown))
+        # 逐页视觉结局：只在本次真的走了视觉提取时非 None（未启用视觉时为 None，
+        # 那类预览与改动前逐字相同）。上面那步 preview() 已经把记录放进缓存，
+        # 这里只是取回，不重算、不再次调用模型。
+        vision = ck.cached_vision_extraction(file_path)
         html = viz.render_chunk_report(
             wb.chunks,
             diagnostics=wb.diagnostics,
@@ -215,16 +219,20 @@ class PDFLearningAssistant:
             param_specs=ck.param_specs(strategy),
             coverage=coverage,
             quality=ck.cached_quality_report(file_path),
+            vision=vision,
         )
 
         # 状态串只在有问题时多说一句：合格且覆盖完整时保持原样，不拿「一切正常」
         # 去占位置。两行摘要与面板里的区块出自同一份报告，说法一致。
+        # 视觉那一行是例外——它全成功时也说，因为「每页各自是什么结局」是要求
+        # 交代的内容，不是告警（spec「视觉解析的结局逐页可查」）。
         status = (
             f"✅ 预览完成：{label}，共 {len(wb.materialized)} 个 chunk。"
             f"确认无误后点击「确认入库」写入知识库。"
         )
         notes = [
             viz.summarize_quality(ck.cached_quality_report(file_path)),
+            viz.summarize_vision(vision),
             viz.summarize_coverage(coverage),
         ]
         notes = [n for n in notes if n]

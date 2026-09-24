@@ -112,6 +112,24 @@ _CSS = """
     .cv-quality-head { font-weight: 700; font-size: 14px; color: #c05621; margin-bottom: 6px; }
     .cv-quality-reasons { margin: 0 0 8px 0; padding-left: 20px; }
     .cv-quality p { margin: 4px 0 0 0; }
+    .cv-vision {
+        background: #f7fafc; border: 1px solid #cbd5e0; border-left: 4px solid #4a5568;
+        border-radius: 8px; padding: 12px 16px; margin-bottom: 20px;
+        font-size: 13px; color: #2d3748; line-height: 1.6;
+    }
+    .cv-vision-head { font-weight: 700; font-size: 14px; color: #2d3748; margin-bottom: 6px; }
+    .cv-vision p { margin: 4px 0 0 0; }
+    .cv-vision table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+    .cv-vision th, .cv-vision td {
+        border-bottom: 1px solid #e2e8f0; padding: 3px 8px; text-align: right;
+    }
+    .cv-vision th { color: #4a5568; font-weight: 600; }
+    .cv-vision th:first-child, .cv-vision td:first-child { text-align: left; }
+    .cv-vision tr.is-empty td { color: #975a16; }
+    .cv-vision tr.is-failed td { color: #c53030; font-weight: 600; }
+    .cv-vision details { margin-top: 8px; }
+    .cv-vision summary { cursor: pointer; color: #4a5568; }
+    .cv-vision-note { color: #718096; font-size: 12px; }
 </style>
 """
 
@@ -300,6 +318,105 @@ def summarize_coverage(coverage: Optional[Dict[str, Any]]) -> str:
     )
 
 
+#: 逐页结局的显示名。键就是 ``vision.PageResult.status`` 的三个取值——这里是
+#: 渲染层，不 import 那个模块（它还带 pypdfium2 与 PIL），所以取了这样一份
+#: 映射而不是直接引用常量；取值变了这里会显示原始字面量，不会静默显示成别的东西。
+#: 措辞与 :meth:`VisionExtraction.summary` 那一行**逐字对齐**：「失败」单独出现
+#: 会与「空」混起来，两处都写「调用失败」才不会读成两种事实。
+_VISION_STATUS_LABEL = {"ok": "成功", "empty": "空", "failed": "调用失败"}
+
+_VISION_STATUS_CLASS = {"empty": "is-empty", "failed": "is-failed"}
+
+
+def summarize_vision(extraction: Optional[Any]) -> str:
+    """视觉解析结局的一行摘要，供预览状态串取用；未走视觉时返回空串。
+
+    与 :func:`summarize_quality` / :func:`summarize_coverage` 的「合格就返回空串」
+    **故意不同**：那两个是告警，健康时不打扰；这一行是逐页交代结局的计数
+    （spec「视觉解析的结局逐页可查」），全部成功时它本身就是内容而不是噪声。
+
+    未启用视觉时整份文件不走这条路，调用方传进来的是 ``None``，于是那类预览的
+    状态串与改动前逐字相同。
+    """
+    if extraction is None:
+        return ""
+    return extraction.summary()
+
+
+def render_vision_block(extraction: Optional[Any]) -> str:
+    """渲染逐页视觉结局与「转写字符数 vs 同页文本层字符数」；未走视觉时返回空串。
+
+    **只呈现，不判定**（spec「转写与文本层的对照只呈现不判定」）：表里没有比值、
+    没有按比例算出的好坏标记，也不触发任何告警。两个数相差很大是常见形态
+    （第 31 页转写 1239 字符、文本层 1439 字符），但那个差说明不了哪一份更准
+    ——文本层被 PDF 拆碎，转写可能漏掉表格，各有各的失真方式，判断要人来做。
+
+    ``extraction`` 只用到 ``summary()`` 与 ``page_rows()` 两个方法，所以这里不必
+    认识 ``vision`` 模块；未走视觉时传 ``None``，区块不出现。
+    """
+    if extraction is None:
+        return ""
+
+    rows = extraction.page_rows()
+    if not rows:
+        return ""
+
+    failed = [r for r in rows if r.get("status") == "failed"]
+    body: List[str] = []
+    for r in rows:
+        status = r.get("status", "")
+        label = _VISION_STATUS_LABEL.get(status, status)
+        cls = _VISION_STATUS_CLASS.get(status, "")
+        # 失败页的「说明」以正文来源开头，错误信息跟在后面——只写异常名会让人以为
+        # 那一页什么都没有，而它其实有文本层兜底（D8，spec 要求说明正文取自何处）。
+        note = ""
+        if status == "failed":
+            note = "正文取自既有文本层"
+            if r.get("error"):
+                note += f"；{_escape_html(str(r['error'])[:160])}"
+        elif r.get("error"):
+            note = _escape_html(str(r["error"])[:160])
+        cls_attr = f' class="{cls}"' if cls else ""
+        body.append(
+            f"<tr{cls_attr}>"
+            f'<td>第 {r.get("index", "?")} 页</td>'
+            f"<td>{_escape_html(label)}</td>"
+            f'<td>{r.get("transcribe_chars", 0):,}</td>'
+            f'<td>{r.get("layer_chars", 0):,}</td>'
+            f'<td>{r.get("vision_blocks", 0)}</td>'
+            f"<td>{note}</td>"
+            f"</tr>"
+        )
+
+    table_rows = "".join(body)
+    summary_html = _escape_html(extraction.summary()).replace("\n", "<br>")
+    # 几十页的表会让面板很长，默认折叠；计数与未成功项在摘要行里已经能读到，
+    # 展开是为了逐页核对，不是为了第一眼看见。有未成功的页时默认展开——那正是
+    # 需要人看一眼的场合。
+    open_attr = " open" if failed else ""
+
+    return f"""
+        <div class="cv-vision">
+            <div class="cv-vision-head">🖼️ 视觉解析</div>
+            <p>{summary_html}</p>
+            <details{open_attr}>
+                <summary>逐页对照（{len(rows)} 页）：转写字符数 vs 同页文本层字符数</summary>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>页</th><th>结局</th><th>转写字符</th>
+                            <th>文本层字符</th><th>视觉块</th><th>说明</th>
+                        </tr>
+                    </thead>
+                    <tbody>{table_rows}</tbody>
+                </table>
+                <p class="cv-vision-note">两列字符数只作对照，不据此判定哪一页更好：
+                   文本层可能被 PDF 拆碎，转写可能漏掉表格。</p>
+            </details>
+        </div>
+    """
+
+
 def render_chunk_cards(chunks: Sequence[Dict[str, Any]]) -> str:
     """渲染 chunk 卡片列表。
 
@@ -484,9 +601,10 @@ def render_chunk_report(
     extra_params_html: str = "",
     coverage: Optional[Dict[str, Any]] = None,
     quality: Optional[Dict[str, Any]] = None,
+    vision: Optional[Any] = None,
     stored: bool = False,
 ) -> str:
-    """渲染完整的切分报告：统计 + (质量告警) + 参数 + (语义分析) + 卡片列表。
+    """渲染完整的切分报告：统计 + (质量告警) + (视觉解析) + 参数 + (语义分析) + 卡片列表。
 
     ``diagnostics`` 决定要不要渲染语义分析区块。只有语义分割会填它，所以
     界面不需要按策略写分支——段落分割传空字典，曲线和分布自然就不出现。
@@ -497,6 +615,10 @@ def render_chunk_report(
     ``quality`` 是提取质量报告，``stored=True`` 表示它来自**已存 chunk** 而非本次
     提取——两者的告警文案不同（见 :func:`render_quality_block`）。判定合格时两者
     都不渲染任何东西。
+
+    ``vision`` 是逐页视觉结局（``vision.VisionExtraction``，回看路径没有故为
+    ``None``）。它与质量报告相反：不成功时不渲染，成功时**照样**渲染——计数与
+    逐页字符对照是要求呈现的内容，不是告警（见 :func:`render_vision_block`）。
     """
     diagnostics = diagnostics or {}
     parts = [_CSS, '<div class="cv-container">']
@@ -510,6 +632,7 @@ def render_chunk_report(
     """)
 
     parts.append(render_quality_block(quality, stored=stored))
+    parts.append(render_vision_block(vision))
 
     if params is not None and param_specs is not None:
         parts.append(render_param_bar(strategy_label, params, param_specs))
